@@ -1,0 +1,50 @@
+---
+# Manual recovery: re-enable the ports recorded in snapshots/<host>.json
+# (only those that were admin UP before the change). Stops with a clear message
+# when there is no snapshot, i.e. nothing left to restore.
+#
+#   ansible-playbook restore_ports.yml --limit lab-sw01
+
+- name: Re-enable ports from the saved snapshot
+  hosts: swim_targets
+  serial: 1
+  gather_facts: false
+  connection: local
+
+  vars:
+    catc_device_hostname: "{{ catc_hostname | default(inventory_hostname) }}"
+    snapshot_file: "{{ playbook_dir }}/snapshots/{{ inventory_hostname }}.json"
+
+  module_defaults:
+    cisco.catalystcenter.network_device_info: &catc
+      catalystcenter_host: "{{ catc_host }}"
+      catalystcenter_port: "{{ catc_port }}"
+      catalystcenter_username: "{{ catc_username }}"
+      catalystcenter_password: "{{ catc_password }}"
+      catalystcenter_verify: "{{ catc_verify }}"
+      catalystcenter_version: "{{ catc_version }}"
+    cisco.catalystcenter.network_device_sync: *catc
+    cisco.catalystcenter.interface_network_device_info: *catc
+    cisco.catalystcenter.interface_update: *catc
+    cisco.catalystcenter.task_info: *catc
+
+  tasks:
+    - name: Look up the device in Catalyst Center
+      cisco.catalystcenter.network_device_info:
+        hostname:
+          - "{{ catc_device_hostname }}"
+      register: device_lookup
+
+    - name: Exactly one device must match
+      ansible.builtin.assert:
+        that:
+          - device_lookup.catalystcenter_response.response | length == 1
+        fail_msg: "{{ catc_device_hostname }} matched {{ device_lookup.catalystcenter_response.response | length }} device(s)"
+        quiet: true
+
+    - name: Record device id
+      ansible.builtin.set_fact:
+        device_id: "{{ device_lookup.catalystcenter_response.response[0].id }}"
+
+    - name: Re-enable ports
+      ansible.builtin.include_tasks: tasks/ports_up.yml

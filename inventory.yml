@@ -1,0 +1,10 @@
+---
+# One inventory host per switch to upgrade. Nothing connects to the switches directly:
+# every task runs on the control node and talks to Catalyst Center.
+all:
+  children:
+    swim_targets:
+      hosts:
+        lab-sw01:
+          # Hostname as Catalyst Center knows it (often the FQDN). Defaults to the inventory name.
+          # catc_hostname: lab-sw01.example.local

@@ -1,0 +1,102 @@
+---
+- name: Read interfaces
+  ansible.builtin.include_tasks: get_interfaces.yml
+
+- name: Look for an existing snapshot
+  ansible.builtin.stat:
+    path: "{{ snapshot_file }}"
+  register: snapshot_stat
+
+- name: Load the existing snapshot
+  ansible.builtin.set_fact:
+    existing_snapshot: "{{ lookup('ansible.builtin.file', snapshot_file) | from_json }}"
+  when: snapshot_stat.stat.exists
+
+# Keep an existing snapshot for the same device, so a re-run after a partial failure
+# does not record already-shut ports as "originally down".
+- name: Reuse the existing snapshot
+  ansible.builtin.set_fact:
+    port_snapshot: "{{ existing_snapshot }}"
+  when:
+    - existing_snapshot is defined
+    - existing_snapshot.device_id == device_id
+
+# A block's "when" is re-evaluated for every task inside it, so decide once with a flag
+# (testing port_snapshot directly would skip the save step after the snapshot is assembled).
+- name: Decide whether a new snapshot is needed
+  ansible.builtin.set_fact:
+    snapshot_is_new: "{{ port_snapshot is not defined }}"
+
+- name: Build a new snapshot
+  when: snapshot_is_new | bool
+  block:
+    - name: Collect port state
+      ansible.builtin.set_fact:
+        snapshot_ports: >-
+          {{ snapshot_ports | default([]) + [{
+               'name': item,
+               'adminStatus': if_by_name[item].adminStatus,
+               'operStatus': if_by_name[item].status,
+               'description': if_by_name[item].description | default('')
+             }] }}
+      loop: "{{ ports_to_cycle }}"
+
+    - name: Assemble snapshot
+      ansible.builtin.set_fact:
+        port_snapshot:
+          device_id: "{{ device_id }}"
+          hostname: "{{ catc_device_hostname }}"
+          taken_at: "{{ now(utc=true).isoformat() }}"
+          ports: "{{ snapshot_ports }}"
+
+    - name: Save snapshot to disk
+      ansible.builtin.copy:
+        content: "{{ port_snapshot | to_nice_json }}\n"
+        dest: "{{ snapshot_file }}"
+        mode: "0640"
+
+- name: Show snapshot
+  ansible.builtin.debug:
+    msg: "{{ port_snapshot.ports | map(attribute='name') | zip(port_snapshot.ports | map(attribute='adminStatus')) | map('join', ' admin=') | list }}"
+
+# Only shut ports that were UP at snapshot time and are still UP now.
+- name: Select ports to shut
+  ansible.builtin.set_fact:
+    ports_to_shut: >-
+      {{ port_snapshot.ports | selectattr('adminStatus', 'equalto', 'UP') | map(attribute='name')
+         | select('in', if_by_name | dict2items | selectattr('value.adminStatus', 'equalto', 'UP')
+                         | map(attribute='key') | list)
+         | list }}
+
+- name: Shut ports
+  cisco.catalystcenter.interface_update:
+    interfaceUuid: "{{ if_by_name[item].id }}"
+    adminStatus: DOWN
+    deploymentMode: Deploy
+  loop: "{{ ports_to_shut }}"
+  register: shut_results
+
+- name: Wait for the shutdown tasks
+  ansible.builtin.include_tasks: wait_for_tasks.yml
+  vars:
+    wait_task_ids: "{{ shut_results.results | map(attribute='catalystcenter_response.response.taskId') | list }}"
+  when: ports_to_shut | length > 0
+
+- name: Resync so inventory reflects the change
+  cisco.catalystcenter.network_device_sync:
+    forceSync: true
+    payload:
+      - "{{ device_id }}"
+  when: ports_to_shut | length > 0
+
+- name: Confirm the ports are admin down
+  cisco.catalystcenter.interface_network_device_info:
+    deviceId: "{{ device_id }}"
+  register: check_down
+  until: >-
+    check_down.catalystcenter_response.response
+    | selectattr('portName', 'in', ports_to_shut)
+    | selectattr('adminStatus', 'equalto', 'UP') | list | length == 0
+  retries: "{{ port_state_poll_retries }}"
+  delay: "{{ port_state_poll_delay }}"
+  when: ports_to_shut | length > 0

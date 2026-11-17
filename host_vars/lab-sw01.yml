@@ -1,0 +1,4 @@
+---
+ports_to_cycle:
+  - GigabitEthernet1/0/1
+  - GigabitEthernet1/0/2

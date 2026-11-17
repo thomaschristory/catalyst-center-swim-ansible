@@ -1,0 +1,19 @@
+---
+# Sets if_by_name: dict of portName -> interface record for the current device.
+- name: Read device interfaces
+  cisco.catalystcenter.interface_network_device_info:
+    deviceId: "{{ device_id }}"
+  register: interfaces_raw
+
+- name: Index interfaces by name
+  ansible.builtin.set_fact:
+    if_by_name: >-
+      {{ dict(interfaces_raw.catalystcenter_response.response | map(attribute='portName')
+              | zip(interfaces_raw.catalystcenter_response.response)) }}
+
+- name: All listed ports must exist on the device
+  ansible.builtin.assert:
+    that:
+      - ports_to_cycle | difference(if_by_name.keys() | list) | length == 0
+    fail_msg: "Not found on {{ catc_device_hostname }}: {{ ports_to_cycle | difference(if_by_name.keys() | list) }}"
+    quiet: true

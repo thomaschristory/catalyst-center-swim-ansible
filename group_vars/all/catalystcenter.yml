@@ -1,0 +1,31 @@
+---
+# Catalyst Center connection
+catc_host: catalyst-center.example.local
+catc_port: 443
+catc_username: "{{ lookup('ansible.builtin.env', 'CATC_USERNAME') | default('apiuser', true) }}"
+catc_password: "{{ lookup('ansible.builtin.env', 'CATC_PASSWORD') }}"
+catc_verify: true
+# The SDK has no 2.3.7.11 profile; 2.3.7.9 is the closest and selects the pre-3.1.3 SWIM API flow.
+catc_version: "2.3.7.9"
+
+# Image to install (must already be in the Catalyst Center image repository)
+image_name: cat9k_iosxe.17.12.04.SPA.bin
+# Version string the device should report after the upgrade (leading zeros are ignored in the comparison)
+target_version: "17.12.04"
+
+# Port handling
+# Per-host list of full interface names to shut before activation and re-enable afterwards.
+ports_to_cycle: []
+# Bring ports back up automatically if something fails inside the upgrade window.
+restore_ports_on_failure: true
+
+# Waits
+task_poll_retries: 40
+task_poll_delay: 15
+version_poll_retries: 30
+version_poll_delay: 60
+port_state_poll_retries: 10
+port_state_poll_delay: 30
+
+# Safety gate: the upgrade window (port shutdown + activation) only runs with -e allow_upgrade=true
+allow_upgrade: false

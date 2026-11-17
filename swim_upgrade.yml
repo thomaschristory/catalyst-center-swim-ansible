@@ -1,0 +1,134 @@
+---
+# Catalyst Center SWIM upgrade with a port maintenance window.
+#
+#   distribute (no impact) > snapshot ports > shut ports > activate (reload) >
+#   wait for target version > re-enable ports
+#
+# Tags:
+#   distribute       copy the image to flash only
+#   upgrade          the upgrade window (needs -e allow_upgrade=true)
+#
+# Manual recovery (re-enable ports from the saved snapshot): restore_ports.yml
+
+- name: Catalyst Center SWIM upgrade with port maintenance window
+  hosts: swim_targets
+  serial: 1
+  gather_facts: false
+  connection: local
+
+  vars:
+    catc_device_hostname: "{{ catc_hostname | default(inventory_hostname) }}"
+    snapshot_file: "{{ playbook_dir }}/snapshots/{{ inventory_hostname }}.json"
+    # strips leading zeros per version segment: 17.12.04 -> 17.12.4
+    version_norm_re: '(^|[.])0+([0-9])'
+
+  module_defaults:
+    cisco.catalystcenter.network_device_info: &catc
+      catalystcenter_host: "{{ catc_host }}"
+      catalystcenter_port: "{{ catc_port }}"
+      catalystcenter_username: "{{ catc_username }}"
+      catalystcenter_password: "{{ catc_password }}"
+      catalystcenter_verify: "{{ catc_verify }}"
+      catalystcenter_version: "{{ catc_version }}"
+    cisco.catalystcenter.network_device_sync: *catc
+    cisco.catalystcenter.interface_network_device_info: *catc
+    cisco.catalystcenter.interface_update: *catc
+    cisco.catalystcenter.task_info: *catc
+    cisco.catalystcenter.swim_workflow_manager: *catc
+
+  tasks:
+    - name: Look up the device in Catalyst Center
+      cisco.catalystcenter.network_device_info:
+        hostname:
+          - "{{ catc_device_hostname }}"
+      register: device_lookup
+      tags: [always]
+
+    - name: Exactly one device must match
+      ansible.builtin.assert:
+        that:
+          - device_lookup.catalystcenter_response.response | length == 1
+        fail_msg: "{{ catc_device_hostname }} matched {{ device_lookup.catalystcenter_response.response | length }} device(s)"
+        quiet: true
+      tags: [always]
+
+    - name: Record device id and current version
+      ansible.builtin.set_fact:
+        device_id: "{{ device_lookup.catalystcenter_response.response[0].id }}"
+        version_before: "{{ device_lookup.catalystcenter_response.response[0].softwareVersion }}"
+      tags: [always]
+
+    - name: Distribute the image to flash (no reload)
+      cisco.catalystcenter.swim_workflow_manager:
+        state: merged
+        config:
+          - image_distribution_details:
+              image_name: "{{ image_name }}"
+              device_hostname: "{{ catc_device_hostname }}"
+      tags: [distribute, upgrade]
+
+    - name: Upgrade window
+      tags: [upgrade]
+      block:
+        - name: Safety gate
+          ansible.builtin.assert:
+            that:
+              - allow_upgrade | bool
+            fail_msg: "Upgrade window blocked: re-run with -e allow_upgrade=true. This shuts ports and reloads {{ catc_device_hostname }}."
+            quiet: true
+
+        - name: Snapshot and shut ports
+          ansible.builtin.include_tasks: tasks/ports_down.yml
+          when: ports_to_cycle | length > 0
+
+        - name: Activate the image (reloads the device)
+          cisco.catalystcenter.swim_workflow_manager:
+            state: merged
+            config:
+              - image_activation_details:
+                  image_name: "{{ image_name }}"
+                  device_hostname: "{{ catc_device_hostname }}"
+                  distribute_if_needed: false
+                  activate_lower_image_version: false
+                  device_upgrade_mode: currentlyExists
+                  schedule_validate: false
+
+        - name: Ask Catalyst Center to resync the device
+          cisco.catalystcenter.network_device_sync:
+            forceSync: true
+            payload:
+              - "{{ device_id }}"
+
+        - name: Wait for the device to report the target version
+          cisco.catalystcenter.network_device_info:
+            id: "{{ device_id }}"
+          register: device_after
+          until: >-
+            (device_after.catalystcenter_response.response.softwareVersion | default('')
+              | regex_replace(version_norm_re, '\\1\\2'))
+            == (target_version | regex_replace(version_norm_re, '\\1\\2'))
+          retries: "{{ version_poll_retries }}"
+          delay: "{{ version_poll_delay }}"
+
+        - name: Re-enable ports
+          ansible.builtin.include_tasks: tasks/ports_up.yml
+          when: ports_to_cycle | length > 0
+
+        - name: Report
+          ansible.builtin.debug:
+            msg: "{{ catc_device_hostname }}: {{ version_before }} -> {{ device_after.catalystcenter_response.response.softwareVersion }}"
+
+      rescue:
+        - name: Show what failed
+          ansible.builtin.debug:
+            msg: "Upgrade window failed at '{{ ansible_failed_task.name }}': {{ ansible_failed_result.msg | default(ansible_failed_result) }}"
+
+        - name: Try to bring the ports back up
+          ansible.builtin.include_tasks: tasks/ports_up.yml
+          when:
+            - restore_ports_on_failure | bool
+            - port_snapshot is defined
+
+        - name: Fail the host
+          ansible.builtin.fail:
+            msg: "Upgrade of {{ catc_device_hostname }} failed; check Catalyst Center and the port state before retrying."

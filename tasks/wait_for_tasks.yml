@@ -1,0 +1,21 @@
+---
+# Input: wait_task_ids (list of Catalyst Center task ids)
+- name: Wait for Catalyst Center tasks to finish
+  cisco.catalystcenter.task_info:
+    taskId: "{{ item }}"
+  loop: "{{ wait_task_ids }}"
+  register: task_results
+  until: (task_results.catalystcenter_response.response | default({})).endTime is defined
+  retries: "{{ task_poll_retries }}"
+  delay: "{{ task_poll_delay }}"
+
+- name: No task may be in error
+  ansible.builtin.assert:
+    that:
+      - task_results.results | map(attribute='catalystcenter_response') | map(attribute='response')
+        | selectattr('isError') | list | length == 0
+    fail_msg: >-
+      Failed tasks: {{ task_results.results | map(attribute='catalystcenter_response')
+                       | map(attribute='response') | selectattr('isError')
+                       | map(attribute='failureReason', default='?') | list }}
+    quiet: true
